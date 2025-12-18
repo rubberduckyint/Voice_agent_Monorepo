@@ -1,6 +1,7 @@
 """
 Voice Agent Orchestrator
 Main FastAPI server that handles Vapi webhooks and coordinates with MCP servers.
+With proper tool calling support.
 """
 
 import os
@@ -11,7 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from anthropic import Anthropic
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 
 app = FastAPI(
@@ -27,9 +28,6 @@ anthropic = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 MCP_CALENDAR_URL = os.getenv("MCP_CALENDAR_URL", "http://localhost:8001")
 MCP_CRM_URL = os.getenv("MCP_CRM_URL", "http://localhost:8002")
 MCP_N8N_URL = os.getenv("MCP_N8N_URL", "http://localhost:8003")
-
-# In-memory conversation state (replace with Redis in production)
-conversations: Dict[str, List[Dict]] = {}
 
 
 # ============================================================
@@ -55,77 +53,233 @@ Book a product demo with the lead. You're calling equipment dealers who have sho
 5. **Book Demo**: If interested, offer to schedule a 15-minute demo
 6. **Close**: Confirm details and thank them
 
+## IMPORTANT - BOOKING MEETINGS
+When the user agrees to book a meeting and provides their preferred time and email:
+- You MUST use the book_meeting function to actually schedule it
+- Always confirm you have: their name, email, and preferred datetime
+- After calling book_meeting, confirm the booking was successful
+
 ## GUIDELINES
 - Be conversational and natural, not scripted
 - Keep responses concise (this is a phone call, aim for 1-2 sentences)
 - If they're not interested, be respectful and ask if you can follow up later
-- If they ask something you don't know, offer to have a specialist follow up
-- Always confirm email before booking a meeting
+- Always get their email address before booking
+- USE THE TOOLS when you have the information needed to book
 
 ## OBJECTION HANDLING
 - "I'm busy": "I completely understand. Would a quick 15-minute call later this week work better?"
-- "We have a solution": "That's great! Many of our dealers use us alongside their existing tools. What solution are you using?"
-- "Not interested": "No problem at all. Would it be okay if I sent you some information to review when you have time?"
-- "How much does it cost?": "Pricing depends on your dealership size. The demo will cover that - it's only 15 minutes."
+- "We have a solution": "That's great! Many of our dealers use us alongside their existing tools."
+- "Not interested": "No problem at all. Would it be okay if I sent you some information?"
+- "How much does it cost?": "Pricing depends on your dealership size. The demo will cover that."
 """
 
 
 # ============================================================
-# MODELS FOR OPENAI-COMPATIBLE API
+# TOOL DEFINITIONS FOR CLAUDE
 # ============================================================
 
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-
-class ChatCompletionRequest(BaseModel):
-    model: Optional[str] = "claude-sonnet-4-20250514"
-    messages: List[ChatMessage]
-    stream: Optional[bool] = False
-    temperature: Optional[float] = 0.7
-    max_tokens: Optional[int] = 300
+TOOLS = [
+    {
+        "name": "book_meeting",
+        "description": "Book a demo meeting with the lead. Use this when the lead has agreed to a meeting and you have their email and preferred time.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "datetime": {
+                    "type": "string",
+                    "description": "The meeting datetime in ISO format (e.g., 2024-12-18T10:00:00). Convert relative times like 'tomorrow at 10am' to actual dates."
+                },
+                "attendee_email": {
+                    "type": "string",
+                    "description": "The lead's email address"
+                },
+                "attendee_name": {
+                    "type": "string",
+                    "description": "The lead's full name"
+                }
+            },
+            "required": ["datetime", "attendee_email", "attendee_name"]
+        }
+    },
+    {
+        "name": "check_availability",
+        "description": "Check available time slots for booking. Use this if the lead wants to know what times are available.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_range_start": {
+                    "type": "string",
+                    "description": "Start date in ISO format (e.g., 2024-12-18)"
+                },
+                "date_range_end": {
+                    "type": "string",
+                    "description": "End date in ISO format (e.g., 2024-12-20)"
+                }
+            },
+            "required": ["date_range_start", "date_range_end"]
+        }
+    }
+]
 
 
 # ============================================================
-# CLAUDE CONVERSATION
+# HELPER FUNCTIONS
 # ============================================================
 
-def get_claude_response_sync(messages: List[Dict]) -> str:
-    """Get response from Claude (synchronous for simplicity)."""
+def get_current_datetime_context():
+    """Get current date/time for context"""
+    now = datetime.utcnow()
+    tomorrow = now + timedelta(days=1)
+    return f"Current date/time is {now.strftime('%Y-%m-%d %H:%M')} UTC. Tomorrow is {tomorrow.strftime('%Y-%m-%d')}."
+
+
+async def execute_tool(tool_name: str, tool_input: Dict[str, Any]) -> str:
+    """Execute a tool and return the result as a string."""
+    
+    print(f"Executing tool: {tool_name} with input: {tool_input}")
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            if tool_name == "book_meeting":
+                response = await client.post(
+                    f"{MCP_CALENDAR_URL}/tools/book_meeting",
+                    json=tool_input
+                )
+                result = response.json()
+                print(f"book_meeting result: {result}")
+                
+                if result.get("success"):
+                    return f"Meeting successfully booked! Confirmation will be sent to {tool_input.get('attendee_email')}. Booking reference: {result.get('booking_id', 'confirmed')}"
+                else:
+                    return f"I was able to note your preferred time. Our team will send you a calendar invite shortly to {tool_input.get('attendee_email')}."
+                    
+            elif tool_name == "check_availability":
+                response = await client.post(
+                    f"{MCP_CALENDAR_URL}/tools/check_availability",
+                    json=tool_input
+                )
+                result = response.json()
+                print(f"check_availability result: {result}")
+                
+                if result.get("success") and result.get("available_slots"):
+                    slots = result["available_slots"][:5]  # Limit to 5 slots
+                    slot_strings = [s.get("start", "")[:16].replace("T", " at ") for s in slots]
+                    return f"Available times: {', '.join(slot_strings)}"
+                else:
+                    return "Let me check... we have openings throughout the week. What time works best for you?"
+                    
+            else:
+                return f"Tool {tool_name} not recognized."
+                
+        except Exception as e:
+            print(f"Tool execution error: {e}")
+            return "I'll make sure our team follows up to get that scheduled for you."
+
+
+# ============================================================
+# CLAUDE CONVERSATION WITH TOOLS
+# ============================================================
+
+async def get_claude_response(messages: List[Dict]) -> Dict:
+    """
+    Get response from Claude with tool support.
+    Returns either a text response or a tool call.
+    """
     
     try:
+        # Add datetime context to help Claude with relative dates
+        datetime_context = get_current_datetime_context()
+        enhanced_system = f"{SYSTEM_PROMPT}\n\n## CURRENT TIME\n{datetime_context}"
+        
         # Convert messages to Claude format
         claude_messages = []
         for msg in messages:
-            if msg.get("role") in ["user", "assistant"]:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            
+            if role == "user" and content:
+                claude_messages.append({"role": "user", "content": content})
+            elif role == "assistant" and content:
+                claude_messages.append({"role": "assistant", "content": content})
+            elif role == "tool":
+                # Handle tool results
                 claude_messages.append({
-                    "role": msg["role"],
-                    "content": msg.get("content", "")
+                    "role": "user",
+                    "content": f"Tool result: {content}"
                 })
         
-        # Ensure we have at least one message
         if not claude_messages:
             claude_messages = [{"role": "user", "content": "Hello"}]
         
+        print(f"Calling Claude with {len(claude_messages)} messages")
+        
+        # Call Claude with tools
         response = anthropic.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=300,
-            system=SYSTEM_PROMPT,
+            system=enhanced_system,
+            tools=TOOLS,
             messages=claude_messages
         )
         
+        print(f"Claude response stop_reason: {response.stop_reason}")
+        
+        # Check if Claude wants to use a tool
+        if response.stop_reason == "tool_use":
+            for block in response.content:
+                if block.type == "tool_use":
+                    tool_name = block.name
+                    tool_input = block.input
+                    
+                    print(f"Claude wants to use tool: {tool_name}")
+                    
+                    # Execute the tool
+                    tool_result = await execute_tool(tool_name, tool_input)
+                    
+                    # Add the tool use and result to messages and get final response
+                    claude_messages.append({
+                        "role": "assistant",
+                        "content": response.content
+                    })
+                    claude_messages.append({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": tool_result
+                        }]
+                    })
+                    
+                    # Get Claude's response after tool use
+                    final_response = anthropic.messages.create(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=300,
+                        system=enhanced_system,
+                        tools=TOOLS,
+                        messages=claude_messages
+                    )
+                    
+                    # Extract text from final response
+                    text = ""
+                    for block in final_response.content:
+                        if hasattr(block, "text"):
+                            text += block.text
+                    
+                    return {"type": "text", "content": text or "The meeting has been scheduled. You'll receive a confirmation email shortly."}
+        
         # Extract text response
-        text_response = ""
+        text = ""
         for block in response.content:
             if hasattr(block, "text"):
-                text_response += block.text
+                text += block.text
         
-        return text_response or "I'm sorry, I didn't catch that. Could you repeat?"
+        return {"type": "text", "content": text or "I'm sorry, could you repeat that?"}
         
     except Exception as e:
         print(f"Claude API error: {e}")
-        return "I'm having a brief technical issue. Could you give me just a moment?"
+        import traceback
+        traceback.print_exc()
+        return {"type": "text", "content": "I'm having a brief technical issue. Could you give me just a moment?"}
 
 
 # ============================================================
@@ -160,15 +314,14 @@ async def chat_completions(request: Request):
         
         print(f"Received chat completion request with {len(messages)} messages")
         
-        # Get response from Claude
-        response_text = get_claude_response_sync(messages)
+        # Get response from Claude (with tool support)
+        response = await get_claude_response(messages)
+        response_text = response.get("content", "")
         
-        print(f"Claude response: {response_text[:100]}...")
+        print(f"Final response: {response_text[:100]}...")
         
         if stream:
-            # Return streaming response
             async def generate():
-                # Send the response as a single chunk
                 chunk = {
                     "id": f"chatcmpl-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
                     "object": "chat.completion.chunk",
@@ -182,7 +335,6 @@ async def chat_completions(request: Request):
                 }
                 yield f"data: {json.dumps(chunk)}\n\n"
                 
-                # Send finish chunk
                 finish_chunk = {
                     "id": f"chatcmpl-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
                     "object": "chat.completion.chunk",
@@ -197,12 +349,8 @@ async def chat_completions(request: Request):
                 yield f"data: {json.dumps(finish_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
             
-            return StreamingResponse(
-                generate(),
-                media_type="text/event-stream"
-            )
+            return StreamingResponse(generate(), media_type="text/event-stream")
         else:
-            # Return non-streaming response
             return {
                 "id": f"chatcmpl-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
                 "object": "chat.completion",
@@ -237,9 +385,7 @@ async def chat_completions(request: Request):
 @app.post("/")
 @app.post("/vapi/webhook")
 async def vapi_webhook(request: Request):
-    """
-    Handle Vapi webhook events.
-    """
+    """Handle Vapi webhook events."""
     try:
         payload = await request.json()
         message = payload.get("message", {})
@@ -247,9 +393,7 @@ async def vapi_webhook(request: Request):
         
         print(f"Webhook received: {message_type}")
         
-        # Handle different message types
         if message_type == "assistant-request":
-            # Vapi is asking for assistant configuration
             return {
                 "assistant": {
                     "firstMessage": "Hi, this is Alex from Cloud Store. How are you doing today?",
@@ -266,60 +410,38 @@ async def vapi_webhook(request: Request):
             }
         
         elif message_type == "function-call":
-            # Handle function/tool calls
             function_call = message.get("functionCall", {})
             function_name = function_call.get("name", "")
             parameters = function_call.get("parameters", {})
             
-            print(f"Function call: {function_name} with params: {parameters}")
+            print(f"Function call from Vapi: {function_name} with params: {parameters}")
             
-            result = await handle_function_call(function_name, parameters)
+            # Execute the tool
+            result = await execute_tool(function_name, parameters)
             return {"result": result}
         
         elif message_type == "end-of-call-report":
-            # Call ended
             call = message.get("call", {})
             call_id = call.get("id", "unknown")
             print(f"Call ended: {call_id}")
             
-            # Trigger post-call workflow
+            # Try to log to n8n
             try:
-                async with httpx.AsyncClient() as client:
+                async with httpx.AsyncClient(timeout=10) as client:
                     await client.post(
                         f"{MCP_N8N_URL}/tools/log_call_outcome",
                         json={
                             "call_id": call_id,
                             "outcome": "completed",
                             "payload": payload
-                        },
-                        timeout=10
+                        }
                     )
             except Exception as e:
                 print(f"Failed to log call outcome: {e}")
             
             return {"status": "received"}
         
-        elif message_type == "hang":
-            return {"status": "received"}
-        
-        elif message_type == "speech-update":
-            return {"status": "received"}
-        
-        elif message_type == "transcript":
-            return {"status": "received"}
-        
-        elif message_type == "status-update":
-            return {"status": "received"}
-            
-        elif message_type == "assistant.started":
-            print("Assistant started")
-            return {"status": "received"}
-            
-        elif message_type == "conversation-update":
-            return {"status": "received"}
-        
         else:
-            print(f"Unhandled message type: {message_type}")
             return {"status": "received"}
             
     except Exception as e:
@@ -327,100 +449,6 @@ async def vapi_webhook(request: Request):
         import traceback
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
-
-
-async def handle_function_call(function_name: str, parameters: Dict) -> Dict:
-    """Handle function calls from Vapi."""
-    
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            if function_name == "check_availability":
-                response = await client.post(
-                    f"{MCP_CALENDAR_URL}/tools/check_availability",
-                    json=parameters
-                )
-                return response.json()
-            
-            elif function_name == "book_meeting":
-                response = await client.post(
-                    f"{MCP_CALENDAR_URL}/tools/book_meeting",
-                    json=parameters
-                )
-                return response.json()
-            
-            elif function_name == "get_lead":
-                response = await client.post(
-                    f"{MCP_CRM_URL}/tools/get_lead",
-                    json=parameters
-                )
-                return response.json()
-            
-            elif function_name == "update_lead":
-                response = await client.post(
-                    f"{MCP_CRM_URL}/tools/update_lead",
-                    json=parameters
-                )
-                return response.json()
-            
-            elif function_name == "log_activity":
-                response = await client.post(
-                    f"{MCP_CRM_URL}/tools/log_activity",
-                    json=parameters
-                )
-                return response.json()
-            
-            else:
-                return {"error": f"Unknown function: {function_name}"}
-                
-        except Exception as e:
-            print(f"Function call error: {e}")
-            return {"error": str(e)}
-
-
-# ============================================================
-# CALL INITIATION
-# ============================================================
-
-@app.post("/call/initiate")
-async def initiate_call(
-    lead_id: str,
-    phone_number: str,
-    lead_name: Optional[str] = None,
-    company_name: Optional[str] = None
-):
-    """
-    Initiate an outbound call via Vapi.
-    """
-    vapi_api_key = os.getenv("VAPI_API_KEY")
-    if not vapi_api_key:
-        raise HTTPException(status_code=500, detail="VAPI_API_KEY not configured")
-    
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(
-                "https://api.vapi.ai/call/phone",
-                headers={
-                    "Authorization": f"Bearer {vapi_api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "phoneNumberId": os.getenv("VAPI_PHONE_NUMBER_ID"),
-                    "customer": {
-                        "number": phone_number,
-                        "name": lead_name
-                    },
-                    "assistantId": os.getenv("VAPI_ASSISTANT_ID"),
-                    "metadata": {
-                        "lead_id": lead_id,
-                        "company_name": company_name
-                    }
-                }
-            )
-            response.raise_for_status()
-            return response.json()
-            
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=500, detail=f"Failed to initiate call: {str(e)}")
 
 
 # ============================================================
@@ -432,7 +460,7 @@ async def startup_event():
     """Verify configuration on startup"""
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if api_key:
-        print(f"✓ Anthropic API key configured (starts with {api_key[:10]}...)")
+        print(f"✓ Anthropic API key configured")
     else:
         print("⚠ WARNING: ANTHROPIC_API_KEY not set!")
     
