@@ -252,7 +252,7 @@ async def get_claude_response(messages: List[Dict]) -> Dict:
                     
                     # Get Claude's response after tool use
                     final_response = anthropic.messages.create(
-                        model="claude-3-5-sonnet-20241022",
+                        model="claude-sonnet-4-20250514",
                         max_tokens=300,
                         system=enhanced_system,
                         tools=TOOLS,
