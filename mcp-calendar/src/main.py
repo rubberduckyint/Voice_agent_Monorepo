@@ -1,25 +1,53 @@
 """
 MCP Calendar Server
-Handles calendar availability and booking via Calendly API.
+Handles calendar availability and booking via Google Calendar API.
 """
 
 import os
-import httpx
+import json
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 from datetime import datetime, timedelta
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 app = FastAPI(
     title="MCP Calendar Server",
-    description="Calendar MCP server for checking availability and booking meetings via Calendly",
-    version="1.0.0"
+    description="Calendar MCP server for checking availability and booking meetings via Google Calendar",
+    version="2.0.0"
 )
 
-# Calendly API configuration
-CALENDLY_API_KEY = os.getenv("CALENDLY_API_KEY")
-CALENDLY_API_URL = "https://api.calendly.com"
-CALENDLY_EVENT_TYPE_URI = os.getenv("CALENDLY_EVENT_TYPE_URI", "")  # Your event type URI
+# Google Calendar configuration
+GOOGLE_CALENDAR_CREDENTIALS = os.getenv("GOOGLE_CALENDAR_CREDENTIALS")
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
+
+# Initialize Google Calendar service
+calendar_service = None
+
+
+def get_calendar_service():
+    """Get or create Google Calendar service."""
+    global calendar_service
+    
+    if calendar_service:
+        return calendar_service
+    
+    if not GOOGLE_CALENDAR_CREDENTIALS:
+        return None
+    
+    try:
+        # Parse credentials from environment variable
+        creds_dict = json.loads(GOOGLE_CALENDAR_CREDENTIALS)
+        credentials = service_account.Credentials.from_service_account_info(
+            creds_dict,
+            scopes=['https://www.googleapis.com/auth/calendar']
+        )
+        calendar_service = build('calendar', 'v3', credentials=credentials)
+        return calendar_service
+    except Exception as e:
+        print(f"Failed to initialize Google Calendar service: {e}")
+        return None
 
 
 # ============================================================
@@ -32,62 +60,16 @@ class CheckAvailabilityRequest(BaseModel):
 
 
 class BookMeetingRequest(BaseModel):
-    datetime: str  # ISO format datetime (must be an available slot)
+    datetime: str  # ISO format datetime
     attendee_email: str
     attendee_name: str
     notes: Optional[str] = None
+    duration_minutes: Optional[int] = 30
 
 
 class CancelMeetingRequest(BaseModel):
-    booking_id: str  # Calendly event UUID
+    booking_id: str  # Google Calendar event ID
     reason: Optional[str] = None
-
-
-# ============================================================
-# CALENDLY API HELPERS
-# ============================================================
-
-async def calendly_request(method: str, endpoint: str, data: dict = None, params: dict = None) -> dict:
-    """Make authenticated request to Calendly API"""
-    
-    if not CALENDLY_API_KEY:
-        # Return mock data if no API key (for development)
-        return {"mock": True}
-    
-    async with httpx.AsyncClient() as client:
-        url = f"{CALENDLY_API_URL}{endpoint}"
-        headers = {
-            "Authorization": f"Bearer {CALENDLY_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        if method == "GET":
-            response = await client.get(url, headers=headers, params=params)
-        elif method == "POST":
-            response = await client.post(url, headers=headers, json=data)
-        elif method == "DELETE":
-            response = await client.delete(url, headers=headers)
-        else:
-            raise ValueError(f"Unsupported method: {method}")
-        
-        response.raise_for_status()
-        return response.json()
-
-
-async def get_current_user() -> dict:
-    """Get the current Calendly user info"""
-    response = await calendly_request("GET", "/users/me")
-    return response.get("resource", {})
-
-
-async def get_event_types(user_uri: str) -> list:
-    """Get event types for the user"""
-    response = await calendly_request(
-        "GET", 
-        "/event_types",
-        params={"user": user_uri, "active": "true"}
-    )
-    return response.get("collection", [])
 
 
 # ============================================================
@@ -97,11 +79,13 @@ async def get_event_types(user_uri: str) -> list:
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
+    service = get_calendar_service()
     return {
         "status": "healthy",
         "service": "mcp-calendar",
         "timestamp": datetime.utcnow().isoformat(),
-        "calendly_configured": bool(CALENDLY_API_KEY)
+        "google_calendar_configured": service is not None,
+        "calendar_id": GOOGLE_CALENDAR_ID[:20] + "..." if GOOGLE_CALENDAR_ID else None
     }
 
 
@@ -109,23 +93,30 @@ async def health_check():
 async def check_availability(request: CheckAvailabilityRequest):
     """
     Check available time slots for booking.
-    
-    Returns list of available slots within the date range.
+    Returns list of available 30-minute slots within the date range.
     """
     try:
-        # Parse dates
-        start_date = datetime.fromisoformat(request.date_range_start.replace('Z', '+00:00'))
-        end_date = datetime.fromisoformat(request.date_range_end.replace('Z', '+00:00'))
+        service = get_calendar_service()
         
-        if not CALENDLY_API_KEY:
+        # Parse dates
+        try:
+            start_date = datetime.fromisoformat(request.date_range_start.replace('Z', '+00:00'))
+        except:
+            start_date = datetime.strptime(request.date_range_start[:10], '%Y-%m-%d')
+        
+        try:
+            end_date = datetime.fromisoformat(request.date_range_end.replace('Z', '+00:00'))
+        except:
+            end_date = datetime.strptime(request.date_range_end[:10], '%Y-%m-%d')
+            end_date = end_date.replace(hour=23, minute=59)
+        
+        if not service:
             # Return mock availability for development
             slots = []
             current = start_date.replace(hour=9, minute=0, second=0, microsecond=0)
             
             while current < end_date:
-                # Skip weekends
-                if current.weekday() < 5:
-                    # Add morning and afternoon slots
+                if current.weekday() < 5:  # Skip weekends
                     for hour in [9, 10, 11, 14, 15, 16]:
                         slot_start = current.replace(hour=hour)
                         slot_end = slot_start + timedelta(minutes=30)
@@ -133,64 +124,79 @@ async def check_availability(request: CheckAvailabilityRequest):
                         if slot_start >= start_date and slot_end <= end_date:
                             slots.append({
                                 "start": slot_start.isoformat(),
-                                "end": slot_end.isoformat()
+                                "end": slot_end.isoformat(),
+                                "available": True
                             })
                 
                 current += timedelta(days=1)
             
             return {
                 "success": True,
-                "available_slots": slots[:10],  # Limit to 10 slots
+                "available_slots": slots[:10],
                 "mock": True
             }
         
-        # Get user info to find event types
-        user = await get_current_user()
-        user_uri = user.get("uri")
+        # Get existing events from Google Calendar
+        events_result = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=start_date.isoformat() + 'Z' if start_date.tzinfo is None else start_date.isoformat(),
+            timeMax=end_date.isoformat() + 'Z' if end_date.tzinfo is None else end_date.isoformat(),
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
         
-        # Get event types
-        event_types = await get_event_types(user_uri)
+        existing_events = events_result.get('items', [])
         
-        if not event_types:
-            return {
-                "success": False,
-                "error": "No active event types found in Calendly"
-            }
-        
-        # Use the first event type or the configured one
-        event_type_uri = CALENDLY_EVENT_TYPE_URI or event_types[0].get("uri")
-        
-        # Get available times
-        response = await calendly_request(
-            "GET",
-            "/event_type_available_times",
-            params={
-                "event_type": event_type_uri,
-                "start_time": request.date_range_start,
-                "end_time": request.date_range_end
-            }
-        )
-        
-        slots = []
-        for slot in response.get("collection", []):
-            slots.append({
-                "start": slot.get("start_time"),
-                "end": None,  # Calendly doesn't return end time in availability
-                "status": slot.get("status")
+        # Build list of busy times
+        busy_times = []
+        for event in existing_events:
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            end = event['end'].get('dateTime', event['end'].get('date'))
+            busy_times.append({
+                'start': datetime.fromisoformat(start.replace('Z', '+00:00')),
+                'end': datetime.fromisoformat(end.replace('Z', '+00:00'))
             })
+        
+        # Generate available slots (business hours: 9 AM - 5 PM, weekdays)
+        available_slots = []
+        current = start_date.replace(hour=9, minute=0, second=0, microsecond=0)
+        
+        while current < end_date:
+            if current.weekday() < 5:  # Weekdays only
+                for hour in [9, 10, 11, 13, 14, 15, 16]:  # Business hours with lunch break
+                    for minute in [0, 30]:  # 30-minute slots
+                        slot_start = current.replace(hour=hour, minute=minute)
+                        slot_end = slot_start + timedelta(minutes=30)
+                        
+                        if slot_start < start_date or slot_end > end_date:
+                            continue
+                        
+                        # Check if slot conflicts with any existing event
+                        is_available = True
+                        for busy in busy_times:
+                            if (slot_start < busy['end'] and slot_end > busy['start']):
+                                is_available = False
+                                break
+                        
+                        if is_available:
+                            available_slots.append({
+                                "start": slot_start.isoformat(),
+                                "end": slot_end.isoformat(),
+                                "available": True
+                            })
+            
+            current += timedelta(days=1)
         
         return {
             "success": True,
-            "available_slots": slots,
-            "event_type": event_type_uri
+            "available_slots": available_slots[:15],  # Limit to 15 slots
+            "total_available": len(available_slots)
         }
         
-    except httpx.HTTPStatusError as e:
-        return {
-            "success": False,
-            "error": f"Calendly API error: {e.response.status_code} - {e.response.text}"
-        }
     except Exception as e:
+        print(f"Check availability error: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             "success": False,
             "error": str(e)
@@ -200,13 +206,22 @@ async def check_availability(request: CheckAvailabilityRequest):
 @app.post("/tools/book_meeting")
 async def book_meeting(request: BookMeetingRequest):
     """
-    Book a demo meeting.
-    
-    Note: Calendly doesn't support direct booking via API for most plans.
-    This returns a scheduling link instead.
+    Book a demo meeting on Google Calendar.
+    Checks availability first to prevent double-booking.
     """
     try:
-        if not CALENDLY_API_KEY:
+        service = get_calendar_service()
+        
+        # Parse the requested datetime
+        try:
+            meeting_start = datetime.fromisoformat(request.datetime.replace('Z', '+00:00'))
+        except:
+            # Try parsing without timezone
+            meeting_start = datetime.strptime(request.datetime[:16], '%Y-%m-%dT%H:%M')
+        
+        meeting_end = meeting_start + timedelta(minutes=request.duration_minutes or 30)
+        
+        if not service:
             # Return mock booking for development
             booking_id = f"mock_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
             return {
@@ -215,44 +230,79 @@ async def book_meeting(request: BookMeetingRequest):
                 "datetime": request.datetime,
                 "attendee_email": request.attendee_email,
                 "attendee_name": request.attendee_name,
-                "confirmation_message": f"Demo booked for {request.datetime}. Confirmation sent to {request.attendee_email}.",
+                "confirmation_message": f"Demo booked for {meeting_start.strftime('%B %d at %I:%M %p')}. Confirmation sent to {request.attendee_email}.",
                 "mock": True
             }
         
-        # Get user info
-        user = await get_current_user()
-        user_uri = user.get("uri")
+        # Check for conflicts first
+        events_result = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=meeting_start.isoformat() + 'Z' if meeting_start.tzinfo is None else meeting_start.isoformat(),
+            timeMax=meeting_end.isoformat() + 'Z' if meeting_end.tzinfo is None else meeting_end.isoformat(),
+            singleEvents=True
+        ).execute()
         
-        # Get event types to find scheduling link
-        event_types = await get_event_types(user_uri)
+        existing_events = events_result.get('items', [])
         
-        if not event_types:
+        if existing_events:
+            # Time slot is not available
             return {
                 "success": False,
-                "error": "No active event types found"
+                "error": "This time slot is no longer available. Please choose another time.",
+                "conflicts": len(existing_events)
             }
         
-        event_type = event_types[0]
-        scheduling_url = event_type.get("scheduling_url")
+        # Create the calendar event
+        event = {
+            'summary': f'Vehicle Price Evaluator Demo - {request.attendee_name}',
+            'description': f'''Demo meeting with {request.attendee_name}
+            
+Email: {request.attendee_email}
+Notes: {request.notes or 'N/A'}
+
+Booked via Voice Agent''',
+            'start': {
+                'dateTime': meeting_start.isoformat(),
+                'timeZone': 'America/Chicago',  # Adjust timezone as needed
+            },
+            'end': {
+                'dateTime': meeting_end.isoformat(),
+                'timeZone': 'America/Chicago',
+            },
+            'attendees': [
+                {'email': request.attendee_email, 'displayName': request.attendee_name},
+            ],
+            'reminders': {
+                'useDefault': False,
+                'overrides': [
+                    {'method': 'email', 'minutes': 24 * 60},  # 1 day before
+                    {'method': 'popup', 'minutes': 30},  # 30 minutes before
+                ],
+            },
+            'sendUpdates': 'all',  # Send email invitations to attendees
+        }
         
-        # Calendly API doesn't support direct booking on most plans
-        # Return the scheduling link with prefilled info
-        prefilled_url = f"{scheduling_url}?name={request.attendee_name}&email={request.attendee_email}"
-        
-        if request.notes:
-            prefilled_url += f"&a1={request.notes}"
+        # Insert the event
+        created_event = service.events().insert(
+            calendarId=GOOGLE_CALENDAR_ID,
+            body=event,
+            sendUpdates='all'
+        ).execute()
         
         return {
             "success": True,
-            "booking_method": "scheduling_link",
-            "scheduling_url": prefilled_url,
+            "booking_id": created_event.get('id'),
+            "datetime": request.datetime,
             "attendee_email": request.attendee_email,
             "attendee_name": request.attendee_name,
-            "message": f"Please use this link to book: {prefilled_url}",
-            "note": "Direct API booking requires Calendly Enterprise plan"
+            "calendar_link": created_event.get('htmlLink'),
+            "confirmation_message": f"Demo successfully booked for {meeting_start.strftime('%B %d at %I:%M %p')}. A calendar invitation has been sent to {request.attendee_email}."
         }
         
     except Exception as e:
+        print(f"Book meeting error: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             "success": False,
             "error": str(e)
@@ -263,127 +313,79 @@ async def book_meeting(request: BookMeetingRequest):
 async def cancel_meeting(request: CancelMeetingRequest):
     """Cancel an existing booking."""
     try:
-        if not CALENDLY_API_KEY:
+        service = get_calendar_service()
+        
+        if not service:
             return {
                 "success": True,
                 "message": f"Booking {request.booking_id} cancelled",
                 "mock": True
             }
         
-        # Cancel the scheduled event
-        await calendly_request(
-            "POST",
-            f"/scheduled_events/{request.booking_id}/cancellation",
-            data={"reason": request.reason or "Cancelled by agent"}
-        )
+        # Delete the event
+        service.events().delete(
+            calendarId=GOOGLE_CALENDAR_ID,
+            eventId=request.booking_id,
+            sendUpdates='all'  # Notify attendees
+        ).execute()
         
         return {
             "success": True,
-            "message": f"Booking {request.booking_id} has been cancelled"
+            "message": f"Booking {request.booking_id} has been cancelled. Attendees have been notified."
         }
         
-    except httpx.HTTPStatusError as e:
-        return {
-            "success": False,
-            "error": f"Failed to cancel: {e.response.status_code}"
-        }
     except Exception as e:
+        print(f"Cancel meeting error: {e}")
         return {
             "success": False,
             "error": str(e)
         }
 
 
-@app.get("/tools/get_scheduled_events")
-async def get_scheduled_events(
-    min_start_time: Optional[str] = None,
-    max_start_time: Optional[str] = None,
-    status: str = "active"
-):
-    """Get list of scheduled events."""
+@app.get("/tools/get_upcoming_meetings")
+async def get_upcoming_meetings(days: int = 7):
+    """Get upcoming meetings for the next N days."""
     try:
-        if not CALENDLY_API_KEY:
+        service = get_calendar_service()
+        
+        if not service:
             return {
                 "success": True,
-                "events": [],
+                "meetings": [],
                 "mock": True
             }
         
-        user = await get_current_user()
-        user_uri = user.get("uri")
+        now = datetime.utcnow()
+        end_date = now + timedelta(days=days)
         
-        params = {
-            "user": user_uri,
-            "status": status
-        }
+        events_result = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=now.isoformat() + 'Z',
+            timeMax=end_date.isoformat() + 'Z',
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
         
-        if min_start_time:
-            params["min_start_time"] = min_start_time
-        if max_start_time:
-            params["max_start_time"] = max_start_time
+        events = events_result.get('items', [])
         
-        response = await calendly_request(
-            "GET",
-            "/scheduled_events",
-            params=params
-        )
-        
-        events = []
-        for event in response.get("collection", []):
-            events.append({
-                "id": event.get("uri", "").split("/")[-1],
-                "name": event.get("name"),
-                "start_time": event.get("start_time"),
-                "end_time": event.get("end_time"),
-                "status": event.get("status"),
-                "location": event.get("location", {}).get("location")
+        meetings = []
+        for event in events:
+            meetings.append({
+                "id": event.get('id'),
+                "summary": event.get('summary'),
+                "start": event['start'].get('dateTime', event['start'].get('date')),
+                "end": event['end'].get('dateTime', event['end'].get('date')),
+                "attendees": [a.get('email') for a in event.get('attendees', [])]
             })
         
         return {
             "success": True,
-            "events": events
+            "meetings": meetings,
+            "count": len(meetings)
         }
         
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-
-@app.get("/tools/get_scheduling_link")
-async def get_scheduling_link():
-    """Get the scheduling link for the default event type."""
-    try:
-        if not CALENDLY_API_KEY:
-            return {
-                "success": True,
-                "scheduling_url": "https://calendly.com/your-link",
-                "mock": True
-            }
-        
-        user = await get_current_user()
-        user_uri = user.get("uri")
-        
-        event_types = await get_event_types(user_uri)
-        
-        if not event_types:
-            return {
-                "success": False,
-                "error": "No active event types found"
-            }
-        
-        # Return the first active event type's scheduling URL
-        event_type = event_types[0]
-        
-        return {
-            "success": True,
-            "scheduling_url": event_type.get("scheduling_url"),
-            "event_type_name": event_type.get("name"),
-            "duration_minutes": event_type.get("duration")
-        }
-        
-    except Exception as e:
+        print(f"Get upcoming meetings error: {e}")
         return {
             "success": False,
             "error": str(e)
@@ -397,14 +399,19 @@ async def get_scheduling_link():
 @app.on_event("startup")
 async def startup_event():
     """Verify configuration on startup"""
-    if CALENDLY_API_KEY:
-        print("✓ Calendly API key configured")
-        try:
-            user = await get_current_user()
-            print(f"✓ Connected to Calendly as: {user.get('name', 'Unknown')}")
-        except Exception as e:
-            print(f"⚠ Could not verify Calendly connection: {e}")
-    else:
-        print("⚠ Calendly API key not set - running in mock mode")
+    service = get_calendar_service()
     
-    print(f"✓ MCP Calendar Server started")
+    if service:
+        print("✓ Google Calendar service initialized")
+        print(f"✓ Calendar ID: {GOOGLE_CALENDAR_ID}")
+        
+        # Test the connection
+        try:
+            calendar = service.calendars().get(calendarId=GOOGLE_CALENDAR_ID).execute()
+            print(f"✓ Connected to calendar: {calendar.get('summary', 'Unknown')}")
+        except Exception as e:
+            print(f"⚠ Could not verify calendar access: {e}")
+    else:
+        print("⚠ Google Calendar not configured - running in mock mode")
+    
+    print("✓ MCP Calendar Server started")
