@@ -1,6 +1,7 @@
 """
 MCP Calendar Server
 Handles calendar availability and booking via Google Calendar API.
+Uses Domain-Wide Delegation to impersonate a user for sending invites.
 """
 
 import os
@@ -15,19 +16,21 @@ from googleapiclient.discovery import build
 app = FastAPI(
     title="MCP Calendar Server",
     description="Calendar MCP server for checking availability and booking meetings via Google Calendar",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 # Google Calendar configuration
 GOOGLE_CALENDAR_CREDENTIALS = os.getenv("GOOGLE_CALENDAR_CREDENTIALS")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
+# Email of the user to impersonate (must be in your Google Workspace domain)
+GOOGLE_IMPERSONATE_USER = os.getenv("GOOGLE_IMPERSONATE_USER")
 
 # Initialize Google Calendar service
 calendar_service = None
 
 
 def get_calendar_service():
-    """Get or create Google Calendar service."""
+    """Get or create Google Calendar service with Domain-Wide Delegation."""
     global calendar_service
     
     if calendar_service:
@@ -43,6 +46,12 @@ def get_calendar_service():
             creds_dict,
             scopes=['https://www.googleapis.com/auth/calendar']
         )
+        
+        # Use Domain-Wide Delegation to impersonate a user
+        if GOOGLE_IMPERSONATE_USER:
+            credentials = credentials.with_subject(GOOGLE_IMPERSONATE_USER)
+            print(f"✓ Impersonating user: {GOOGLE_IMPERSONATE_USER}")
+        
         calendar_service = build('calendar', 'v3', credentials=credentials)
         return calendar_service
     except Exception as e:
@@ -85,7 +94,8 @@ async def health_check():
         "service": "mcp-calendar",
         "timestamp": datetime.utcnow().isoformat(),
         "google_calendar_configured": service is not None,
-        "calendar_id": GOOGLE_CALENDAR_ID[:20] + "..." if GOOGLE_CALENDAR_ID else None
+        "calendar_id": GOOGLE_CALENDAR_ID[:20] + "..." if GOOGLE_CALENDAR_ID else None,
+        "impersonating": GOOGLE_IMPERSONATE_USER
     }
 
 
@@ -208,6 +218,7 @@ async def book_meeting(request: BookMeetingRequest):
     """
     Book a demo meeting on Google Calendar.
     Checks availability first to prevent double-booking.
+    Creates a Google Meet link and sends invitations.
     """
     try:
         service = get_calendar_service()
@@ -252,7 +263,7 @@ async def book_meeting(request: BookMeetingRequest):
                 "conflicts": len(existing_events)
             }
         
-        # Create the calendar event
+        # Create the calendar event with Google Meet
         event = {
             'summary': f'Vehicle Price Evaluator Demo - {request.attendee_name}',
             'description': f'''Demo meeting with {request.attendee_name}
@@ -279,15 +290,30 @@ Booked via Voice Agent''',
                     {'method': 'popup', 'minutes': 30},  # 30 minutes before
                 ],
             },
-            'sendUpdates': 'all',  # Send email invitations to attendees
+            # Add Google Meet conference
+            'conferenceData': {
+                'createRequest': {
+                    'requestId': f"meet-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
+                    'conferenceSolutionKey': {'type': 'hangoutsMeet'}
+                }
+            },
         }
         
-        # Insert the event
+        # Insert the event with conference data
         created_event = service.events().insert(
             calendarId=GOOGLE_CALENDAR_ID,
             body=event,
-            sendUpdates='all'
+            sendUpdates='all',  # Send email invitations to attendees
+            conferenceDataVersion=1  # Required for Google Meet
         ).execute()
+        
+        # Get the Google Meet link
+        meet_link = None
+        if 'conferenceData' in created_event:
+            for entry_point in created_event['conferenceData'].get('entryPoints', []):
+                if entry_point.get('entryPointType') == 'video':
+                    meet_link = entry_point.get('uri')
+                    break
         
         return {
             "success": True,
@@ -296,7 +322,8 @@ Booked via Voice Agent''',
             "attendee_email": request.attendee_email,
             "attendee_name": request.attendee_name,
             "calendar_link": created_event.get('htmlLink'),
-            "confirmation_message": f"Demo successfully booked for {meeting_start.strftime('%B %d at %I:%M %p')}. A calendar invitation has been sent to {request.attendee_email}."
+            "meet_link": meet_link,
+            "confirmation_message": f"Demo successfully booked for {meeting_start.strftime('%B %d at %I:%M %p')}. A calendar invitation with Google Meet link has been sent to {request.attendee_email}."
         }
         
     except Exception as e:
@@ -404,6 +431,8 @@ async def startup_event():
     if service:
         print("✓ Google Calendar service initialized")
         print(f"✓ Calendar ID: {GOOGLE_CALENDAR_ID}")
+        if GOOGLE_IMPERSONATE_USER:
+            print(f"✓ Impersonating: {GOOGLE_IMPERSONATE_USER}")
         
         # Test the connection
         try:
