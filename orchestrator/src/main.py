@@ -1,7 +1,7 @@
 """
 Voice Agent Orchestrator
 Main FastAPI server that handles Vapi webhooks and coordinates with MCP servers.
-With proper tool calling support.
+With proper tool calling support and availability checking.
 """
 
 import os
@@ -18,7 +18,7 @@ import asyncio
 app = FastAPI(
     title="Voice Agent Orchestrator",
     description="Coordinates voice AI conversations with Claude and MCP tools",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 # Initialize Anthropic client
@@ -53,18 +53,32 @@ Book a product demo with the lead. You're calling equipment dealers who have sho
 5. **Book Demo**: If interested, offer to schedule a 15-minute demo
 6. **Close**: Confirm details and thank them
 
+## CRITICAL - USING TOOL RESULTS
+When you receive tool results, you MUST pay attention to them:
+
+### For check_availability:
+- If `available_slots` is empty or `total_available` is 0: Tell the caller that time is NOT available and suggest a different day
+- If slots are returned: Offer those specific times to the caller
+- NEVER say a time is available if the tool shows no availability
+
+### For book_meeting:
+- If `success` is true: Confirm the booking to the caller
+- If `success` is false: Tell the caller there was an issue and try a different time
+- NEVER confirm a booking if the tool returned success: false
+
 ## IMPORTANT - BOOKING MEETINGS
-When the user agrees to book a meeting and provides their preferred time and email:
-- You MUST use the book_meeting function to actually schedule it
-- Always confirm you have: their name, email, and preferred datetime
-- After calling book_meeting, confirm the booking was successful
+When the user agrees to book a meeting:
+1. First use check_availability to verify the time slot is open
+2. Collect their name and email
+3. Use book_meeting to schedule it
+4. Only confirm if the booking was successful
 
 ## GUIDELINES
 - Be conversational and natural, not scripted
 - Keep responses concise (this is a phone call, aim for 1-2 sentences)
 - If they're not interested, be respectful and ask if you can follow up later
 - Always get their email address before booking
-- USE THE TOOLS when you have the information needed to book
+- ALWAYS check tool results before responding
 
 ## OBJECTION HANDLING
 - "I'm busy": "I completely understand. Would a quick 15-minute call later this week work better?"
@@ -80,8 +94,26 @@ When the user agrees to book a meeting and provides their preferred time and ema
 
 TOOLS = [
     {
+        "name": "check_availability",
+        "description": "Check available time slots for booking. ALWAYS use this before booking to verify the requested time is available. Returns available_slots array - if empty, that time is NOT available.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_range_start": {
+                    "type": "string",
+                    "description": "Start date in ISO format (e.g., 2024-12-18)"
+                },
+                "date_range_end": {
+                    "type": "string",
+                    "description": "End date in ISO format (e.g., 2024-12-20)"
+                }
+            },
+            "required": ["date_range_start", "date_range_end"]
+        }
+    },
+    {
         "name": "book_meeting",
-        "description": "Book a demo meeting with the lead. Use this when the lead has agreed to a meeting and you have their email and preferred time.",
+        "description": "Book a demo meeting with the lead. Only use AFTER confirming availability. Check the 'success' field in the response - only confirm booking if success is true.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -99,24 +131,6 @@ TOOLS = [
                 }
             },
             "required": ["datetime", "attendee_email", "attendee_name"]
-        }
-    },
-    {
-        "name": "check_availability",
-        "description": "Check available time slots for booking. Use this if the lead wants to know what times are available.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "date_range_start": {
-                    "type": "string",
-                    "description": "Start date in ISO format (e.g., 2024-12-18)"
-                },
-                "date_range_end": {
-                    "type": "string",
-                    "description": "End date in ISO format (e.g., 2024-12-20)"
-                }
-            },
-            "required": ["date_range_start", "date_range_end"]
         }
     }
 ]
@@ -140,20 +154,7 @@ async def execute_tool(tool_name: str, tool_input: Dict[str, Any]) -> str:
     
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            if tool_name == "book_meeting":
-                response = await client.post(
-                    f"{MCP_CALENDAR_URL}/tools/book_meeting",
-                    json=tool_input
-                )
-                result = response.json()
-                print(f"book_meeting result: {result}")
-                
-                if result.get("success"):
-                    return f"Meeting successfully booked! Confirmation will be sent to {tool_input.get('attendee_email')}. Booking reference: {result.get('booking_id', 'confirmed')}"
-                else:
-                    return f"I was able to note your preferred time. Our team will send you a calendar invite shortly to {tool_input.get('attendee_email')}."
-                    
-            elif tool_name == "check_availability":
+            if tool_name == "check_availability":
                 response = await client.post(
                     f"{MCP_CALENDAR_URL}/tools/check_availability",
                     json=tool_input
@@ -161,19 +162,56 @@ async def execute_tool(tool_name: str, tool_input: Dict[str, Any]) -> str:
                 result = response.json()
                 print(f"check_availability result: {result}")
                 
-                if result.get("success") and result.get("available_slots"):
-                    slots = result["available_slots"][:5]  # Limit to 5 slots
-                    slot_strings = [s.get("start", "")[:16].replace("T", " at ") for s in slots]
-                    return f"Available times: {', '.join(slot_strings)}"
+                if result.get("success"):
+                    available_slots = result.get("available_slots", [])
+                    total_available = result.get("total_available", len(available_slots))
+                    
+                    if total_available == 0 or len(available_slots) == 0:
+                        # NO AVAILABILITY - be explicit about this
+                        return "NO_AVAILABILITY: There are no available time slots for the requested date. Please ask the caller to try a different day or time."
+                    else:
+                        # Format available slots nicely
+                        slots = available_slots[:5]  # Limit to 5 slots
+                        slot_strings = []
+                        for s in slots:
+                            start = s.get("start", "")[:16]
+                            # Parse and format nicely
+                            try:
+                                dt = datetime.fromisoformat(start)
+                                slot_strings.append(dt.strftime("%I:%M %p"))
+                            except:
+                                slot_strings.append(start.replace("T", " at "))
+                        return f"AVAILABLE_SLOTS: The following times are available: {', '.join(slot_strings)}. Total available slots: {total_available}"
                 else:
-                    return "Let me check... we have openings throughout the week. What time works best for you?"
+                    error = result.get("error", "Unknown error")
+                    return f"ERROR checking availability: {error}. Ask the caller to try again or suggest a different time."
+                    
+            elif tool_name == "book_meeting":
+                response = await client.post(
+                    f"{MCP_CALENDAR_URL}/tools/book_meeting",
+                    json=tool_input
+                )
+                result = response.json()
+                print(f"book_meeting result: {result}")
+                
+                # CRITICAL: Check success field
+                if result.get("success") == True:
+                    booking_id = result.get("booking_id", "confirmed")
+                    meet_link = result.get("meet_link", "")
+                    return f"BOOKING_SUCCESS: Meeting successfully booked! Booking ID: {booking_id}. A calendar invitation with Google Meet link has been sent to {tool_input.get('attendee_email')}."
+                else:
+                    # BOOKING FAILED - be explicit
+                    error = result.get("error", "Unknown error")
+                    return f"BOOKING_FAILED: Could not book the meeting. Reason: {error}. Please apologize to the caller and try a different time."
                     
             else:
-                return f"Tool {tool_name} not recognized."
+                return f"ERROR: Tool {tool_name} not recognized."
                 
         except Exception as e:
             print(f"Tool execution error: {e}")
-            return "I'll make sure our team follows up to get that scheduled for you."
+            import traceback
+            traceback.print_exc()
+            return f"ERROR: Failed to execute {tool_name}: {str(e)}. Please apologize and offer to have someone follow up."
 
 
 # ============================================================
@@ -236,6 +274,8 @@ async def get_claude_response(messages: List[Dict]) -> Dict:
                     # Execute the tool
                     tool_result = await execute_tool(tool_name, tool_input)
                     
+                    print(f"Tool result: {tool_result}")
+                    
                     # Add the tool use and result to messages and get final response
                     claude_messages.append({
                         "role": "assistant",
@@ -265,7 +305,7 @@ async def get_claude_response(messages: List[Dict]) -> Dict:
                         if hasattr(block, "text"):
                             text += block.text
                     
-                    return {"type": "text", "content": text or "The meeting has been scheduled. You'll receive a confirmation email shortly."}
+                    return {"type": "text", "content": text or "I apologize, there was an issue. Let me try to help you another way."}
         
         # Extract text response
         text = ""
@@ -292,6 +332,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "orchestrator",
+        "version": "1.1.0",
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -464,7 +505,7 @@ async def startup_event():
     else:
         print("⚠ WARNING: ANTHROPIC_API_KEY not set!")
     
-    print(f"✓ Orchestrator started")
+    print(f"✓ Orchestrator started (v1.1.0)")
     print(f"  - MCP Calendar: {MCP_CALENDAR_URL}")
     print(f"  - MCP CRM: {MCP_CRM_URL}")
     print(f"  - MCP n8n: {MCP_N8N_URL}")
